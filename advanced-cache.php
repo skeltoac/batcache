@@ -44,7 +44,7 @@ class batcache {
 
 	var $remote  =    0; // Zero disables sending buffers to remote datacenters (req/sec is never sent)
 
-	var $times   =    2; // Only batcache a page after it is accessed this many times... (two or more)
+	var $times   =    1; // Only batcache a page after it is accessed this many times... (two or more)
 	var $seconds =  120; // ...in this many seconds (zero to ignore this and use batcache immediately)
 
 	var $group   = 'batcache'; // Name of memcached group. You can simulate a cache flush by changing this.
@@ -63,14 +63,20 @@ class batcache {
 
 	var $debug   = true; // Set false to hide the batcache info <!-- comment -->
 
-	var $cache_control = true; // Set false to disable Last-Modified and Cache-Control headers
+	var $cache_control = false; // Set false to disable Last-Modified and Cache-Control headers
 
 	var $cancel = false; // Change this to cancel the output buffer. Use batcache_cancel();
 
 	var $noskip_cookies = array( 'wordpress_test_cookie' ); // Names of cookies - if they exist and the cache would normally be bypassed, don't bypass it
 
+	var $add_hit_status_header = true; // Add X-Batache HTTP header for "HIT" "BYPASS" "MISS" etc
+
 	var $genlock = false;
 	var $do = false;
+
+	var $use_stale = true; // Allow stale cache to be served to the client while the page is regenerating (requires PHP-FPM)
+	var $stale_max_age = 30; // Maximum age of the stale cache that can be served. Use 0 for "forever"
+	var $sent_stale = false;
 
 	function batcache( $settings ) {
 		if ( is_array( $settings ) ) foreach ( $settings as $k => $v )
@@ -153,8 +159,14 @@ class batcache {
 	}
 
 	function ob($output) {
-		if ( $this->cancel !== false )
+		if ( $this->cancel !== false ) {
+
+			if ( $this->add_hit_status_header ) {
+				header( 'X-Batcache: BYPASS' );
+			}
+
 			return $output;
+		}
 
 		// PHP5 and objects disappearing before output buffers?
 		wp_cache_init();
@@ -164,12 +176,23 @@ class batcache {
 
 		// Do not batcache blank pages unless they are HTTP redirects
 		$output = trim($output);
-		if ( $output === '' && (!$this->redirect_status || !$this->redirect_location) )
+		if ( $output === '' && (!$this->redirect_status || !$this->redirect_location) ) {
+
+			if ( $this->add_hit_status_header ) {
+				header( 'X-Batcache: BYPASS' );
+			}
+
 			return;
+		}
 
 		// Do not cache 5xx responses
-		if ( isset( $this->status_code ) && intval($this->status_code / 100) == 5 )
+		if ( isset( $this->status_code ) && intval($this->status_code / 100) == 5 ) {
+
+			if ( $this->add_hit_status_header ) {
+				header( 'X-Batcache: BYPASS' );
+			}
 			return $output;
+		}
 
 		$this->do_variants($this->vary);
 		$this->generate_keys();
@@ -198,8 +221,14 @@ class batcache {
 
 		foreach ( $this->cache['headers'] as $header => $values ) {
 			// Do not cache if cookies were set
-			if ( strtolower( $header ) === 'set-cookie' )
+			if ( strtolower( $header ) === 'set-cookie' ) {
+
+				if ( $this->add_hit_status_header ) {
+					header( 'X-Batcache: BYPASS' );
+				}
+
 				return $output;
+			}
 
 			foreach ( (array) $values as $value )
 				if ( preg_match('/^Cache-Control:.*max-?age=(\d+)/i', "$header: $value", $matches) )
@@ -208,7 +237,19 @@ class batcache {
 
 		$this->cache['max_age'] = $this->max_age;
 
-		wp_cache_set($this->key, $this->cache, $this->group, $this->max_age + $this->seconds + 30);
+		if ( $this->use_stale ) {
+
+			$expire = $this->stale_max_age + $this->max_age + $this->seconds + 30;
+
+			if ( $this->stale_max_age === 0 ) {
+				$expire = 0;
+			}
+
+			wp_cache_set( $this->key, $this->cache, $this->group, $expire );
+		} else {
+			wp_cache_set( $this->key, $this->cache, $this->group, $this->max_age + $this->seconds + 30 );	
+		}
+		
 
 		// Unlock regeneration
 		wp_cache_delete("{$this->url_key}_genlock", $this->group);
@@ -230,6 +271,11 @@ class batcache {
 
 		// Pass output to next ob handler
 		batcache_stats( 'batcache', 'total_page_views' );
+
+		if ( $this->add_hit_status_header ) {
+			header( 'X-Batcache: MISS' );
+		}
+
 		return $this->cache['output'];
 	}
 
@@ -319,34 +365,68 @@ if ( in_array(
 		array(
 			'wp-app.php',
 			'xmlrpc.php',
-		) ) )
+		) ) ) {
+
+	if ( $batcache->add_hit_status_header ) {
+		header( 'X-Batcache: BYPASS' );
+	}
 	return;
+}
 
 // Never batcache WP javascript generators
-if ( strstr( $_SERVER['SCRIPT_FILENAME'], 'wp-includes/js' ) )
+if ( strstr( $_SERVER['SCRIPT_FILENAME'], 'wp-includes/js' ) ) {
+
+	if ( $batcache->add_hit_status_header ) {
+		header( 'X-Batcache: BYPASS' );
+	}
+
 	return;
+}
 
 // Never batcache when POST data is present.
-if ( ! empty( $GLOBALS['HTTP_RAW_POST_DATA'] ) || ! empty( $_POST ) )
+if ( ! empty( $GLOBALS['HTTP_RAW_POST_DATA'] ) || ! empty( $_POST ) || $_SERVER['REQUEST_METHOD'] === "POST" ) {
+
+	if ( $batcache->add_hit_status_header ) {
+		header( 'X-Batcache: BYPASS' );
+	}
+
 	return;
+}
 
 // Never batcache when cookies indicate a cache-exempt visitor.
 if ( is_array( $_COOKIE) && ! empty( $_COOKIE ) ) {
 	foreach ( array_keys( $_COOKIE ) as $batcache->cookie ) {
 		if ( ! in_array( $batcache->cookie, $batcache->noskip_cookies ) && ( substr( $batcache->cookie, 0, 2 ) == 'wp' || substr( $batcache->cookie, 0, 9 ) == 'wordpress' || substr( $batcache->cookie, 0, 14 ) == 'comment_author' ) ) {
 			batcache_stats( 'batcache', 'cookie_skip' );
+
+			if ( $batcache->add_hit_status_header ) {
+				header( 'X-Batcache: BYPASS' );
+			}
+
 			return;
 		}
 	}
 }
 
-if ( ! include_once( WP_CONTENT_DIR . '/object-cache.php' ) )
+if ( ! include_once( WP_CONTENT_DIR . '/object-cache.php' ) ) {
+
+	if ( $batcache->add_hit_status_header ) {
+		header( 'X-Batcache: DOWN' );
+	}
+
 	return;
+}
 
 wp_cache_init(); // Note: wp-settings.php calls wp_cache_init() which clobbers the object made here.
 
-if ( ! is_object( $wp_object_cache ) )
+if ( ! is_object( $wp_object_cache ) ) {
+
+	if ( $batcache->add_hit_status_header ) {
+		header( 'X-Batcache: DOWN' );
+	}
+
 	return;
+}
 
 // Now that the defaults are set, you might want to use different settings under certain conditions.
 
@@ -435,7 +515,7 @@ if ( !isset($batcache->cache['max_age']) )
 
 
 // Did we find a batcached page that hasn't expired?
-if ( isset($batcache->cache['time']) && ! $batcache->genlock && time() < $batcache->cache['time'] + $batcache->cache['max_age'] ) {
+if ( isset($batcache->cache['time']) && ! $batcache->genlock && ( time() < $batcache->cache['time'] + $batcache->cache['max_age'] || ( $batcache->use_stale && time() < $batcache->cache['time'] + $batcache->cache['max_age'] + $batcache->stale_max_age ) || ( $batcache->use_stale && $batcache->stale_max_age === 0 ) ) ) {
 	// Issue redirect if cached and enabled
 	if ( $batcache->cache['redirect_status'] && $batcache->cache['redirect_location'] && $batcache->cache_redirects ) {
 		$status = $batcache->cache['redirect_status'];
@@ -468,7 +548,10 @@ if ( isset($batcache->cache['time']) && ! $batcache->genlock && time() < $batcac
 			}
 			header("Location: $location");
 		}
-		exit;
+
+		if ( $batcache->add_hit_status_header ) {
+			header( 'X-Batcache: HIT' );
+		}	
 	}
 
 	// Respect ETags served with feeds.
@@ -503,14 +586,41 @@ if ( isset($batcache->cache['time']) && ! $batcache->genlock && time() < $batcac
 
 	if ( $three04 ) {
 		header("HTTP/1.1 304 Not Modified", true, 304);
+
+		if ( $batcache->add_hit_status_header ) {
+			header( 'X-Batcache: HIT' );
+		}
+
 		die;
 	}
 
 	if ( !empty($batcache->cache['status_header']) )
 		header($batcache->cache['status_header'], true);
 
-	// Have you ever heard a death rattle before?
-	die($batcache->cache['output']);
+	if ( $batcache->add_hit_status_header ) {
+		header( 'X-Batcache: HIT' );
+	}
+
+	// If serving stale cache is enabled, then output it, finish the request and continue as normal
+	if ( function_exists( 'fastcgi_finish_request' ) && $batcache->use_stale && time() >= $batcache->cache['time'] + $batcache->cache['max_age'] ) {
+
+		if ( $batcache->add_hit_status_header ) {
+			header( 'X-Batcache: UPDATING' );	
+		}
+		
+		echo $batcache->cache['output'];
+		$batcache->sent_stale = true;
+		fastcgi_finish_request();
+
+		// now delete the cache and let it be regenerated. We have to delete it incase "this time" anythign
+		// calls batcache_cancel we don't want the same to happen over and over again
+		wp_cache_delete( $batcache->key, $batcache->group );
+
+	} else {
+		// Have you ever heard a death rattle before?
+		echo $batcache->cache['output'];
+		exit;	
+	}
 }
 
 // Didn't meet the minimum condition?
